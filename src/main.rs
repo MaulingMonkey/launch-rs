@@ -1,12 +1,13 @@
 extern crate launchpad;
 extern crate clap;
-extern crate portmidi as pm;
+extern crate midir;
 
 use launchpad::*;
 
 use std::thread;
 use std::process;
 use std::time::Duration;
+use std::num::Wrapping;
 
 mod cli;
 
@@ -19,21 +20,90 @@ fn main() {
         list();
     }
 
-    run();
+    run_mk1();
 }
 
 fn list() -> ! {
-    let context = pm::PortMidi::new().unwrap();
-    let devs = context.devices().unwrap();
+    let input  = midir::MidiInput::new("launch-rs").unwrap();
+    let output = midir::MidiOutput::new("launch-rs").unwrap();
 
-    for d in devs {
-        println!("{:?}", d);
+    println!("inputs:");
+    for port in input.ports() {
+        println!("  {}", input.port_name(&port).unwrap());
+    }
+
+    println!("outputs:");
+    for port in output.ports() {
+        println!("  {}", output.port_name(&port).unwrap());
     }
 
     process::exit(0);
 }
 
-fn run() {
+fn run_mk1() {
+    println!("Please enjoy!");
+    let mut lpad = Launchpad::guess();
+
+    // Buffers
+    let mut top   = [0,0,0,0, 0,0,0,0];
+    let mut right = [0,0,0,0, 0,0,0,0];
+    let mut grid = Vec::new();
+    grid.resize(8*8, 0);
+
+    loop {
+        println!("Clear screen...");
+        lpad.reset();
+        thread::sleep(Duration::from_millis(500));
+
+        println!("Tweak brightness!");
+        for _ in 0..2 {
+            for &level in &[Brightness::Low, Brightness::Medium, Brightness::High] {
+                lpad.light_all(level);
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        println!("Grid colors!");
+        for color in 0..=64 {
+            // XXX: bits 2/3 are copy/clear flags, 7 should be 0.
+            let color = Wrapping(color);
+            let mut local_color = color;
+            for c in &mut top   { *c = local_color.0 & 0x7F; local_color += Wrapping(1); }
+            for c in &mut grid  { *c = local_color.0 & 0x7F; local_color += Wrapping(1); }
+            for c in &mut right { *c = local_color.0 & 0x7F; local_color += Wrapping(1); }
+            lpad.light_grid(&grid[..], &top[..], &right[..]);
+            thread::sleep(Duration::from_millis(16));
+        }
+
+        println!("Cycle colors!");
+        for _ in 0..3 {
+            for &color in &[
+            //    0ggccrr
+                0b0000000,
+                0b0000001,
+                0b0000010,
+                0b0000011,
+                0b0010011,
+                0b0100011,
+                0b0110011,
+                0b0110010,
+                0b0110001,
+                0b0110000,
+                0b0100000,
+                0b0010000,
+            ] {
+                for c in &mut top   { *c = color; }
+                for c in &mut grid  { *c = color; }
+                for c in &mut right { *c = color; }
+                lpad.light_grid(&grid[..], &top[..], &right[..]);
+                //thread::sleep(Duration::from_millis(33));
+                thread::sleep(Duration::from_millis(300));
+            }
+        }
+    }
+}
+
+fn run_mk2() {
     println!("Please enjoy!");
     let timeout = Duration::from_millis(1);
     let mut lpad = LaunchpadMk2::guess();

@@ -1,4 +1,4 @@
-extern crate portmidi as pm;
+extern crate midir;
 
 mod color;
 mod launchpad;

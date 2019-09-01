@@ -4,6 +4,6 @@ version = "0.1.0"
 authors = ["James Munns <james.munns@gmail.com>"]
 
 [dependencies]
-portmidi = "0.2.4"
-launchpad = "*"
+midir = { git = "https://github.com/Boddlnagg/midir", branch = "port-ids" }
+launchpad = { version = "*", path = "lib" }
 clap = "*"

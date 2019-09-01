@@ -9,4 +9,4 @@ repository = "https://github.com/jamesmunns/launch-rs"
 documentation = "https://docs.rs/launchpad"
 
 [dependencies]
-portmidi = "0.2.4"
+midir = { git = "https://github.com/Boddlnagg/midir", branch = "port-ids" }

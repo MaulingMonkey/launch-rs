@@ -2,20 +2,164 @@
 //!
 //! For now, only Launchpad Mark 2 devices are supported.
 
-use pm;
+use midir;
 use color::nearest_palette;
+use std::sync::mpsc;
 
 pub type Color = u8;
 
-/// A Launchpad Mark 2 Device. This library requires the PortMidi device
-/// used to create the launchpad to have the same lifetime. If we create the
-/// PortMidi device ourselves, hold it. Otherwise, trust the implementer to
-/// not destroy it (or further calls will fail (sometimes silently?))
-pub struct LaunchpadMk2 {
-    input_port: pm::InputPort,
-    output_port: pm::OutputPort,
-    midi: Option<pm::PortMidi>,
+pub struct MidiEvent {
+    pub timestamp: u32,
+    pub message: MidiMessage,
 }
+
+pub struct MidiMessage {
+    pub status: u8,
+    pub data1: u8,
+    pub data2: u8,
+}
+
+/// A launchpad device.
+struct LaunchpadInternal {
+    #[allow(dead_code)] input_port: midir::MidiInputConnection<()>, // Must be kept alive to receive messages
+    output_port: midir::MidiOutputConnection,
+    recv: mpsc::Receiver<MidiEvent>,
+}
+
+impl LaunchpadInternal {
+    pub fn guess(expected_name: &str) -> Self {
+        let input  = midir::MidiInput::new("launchpad").expect("Failed to open midir MidiInput Instance!");
+        let output = midir::MidiOutput::new("launchpad").expect("Failed to open midir MidiOutput Instance!");
+        Self::guess_from(input, output, expected_name)
+    }
+
+    /// Attempt to find the first Launchpad Mark 2 by scanning
+    /// available MIDI ports with matching names. Bring your own
+    /// PortMidi.
+    pub fn guess_from(input: midir::MidiInput, output: midir::MidiOutput, expected_name: &str) -> Self {
+        let mut input_port: Option<midir::MidiInputPort> = None;
+        let mut output_port: Option<midir::MidiOutputPort> = None;
+
+        for port in input.ports() {
+            let name = input.port_name(&port).unwrap();
+            if name.contains(expected_name) {
+                input_port = Some(port);
+                break;
+            }
+        }
+
+        for port in output.ports() {
+            let name = output.port_name(&port).unwrap();
+            if name.contains(expected_name) {
+                output_port = Some(port);
+                break;
+            }
+        }
+
+        let input_port  = input_port.expect("No Launchpad Input Found!");
+        let output_port = output_port.expect("No Launchpad Output Found!");
+
+        let (send, recv) = mpsc::channel();
+
+        let input_port = input.connect(&input_port, "", move |time, msg, _user| {
+            match msg {
+                &[status, data1, data2] => {
+                    let event = MidiEvent {
+                        timestamp: time as u32,
+                        message: MidiMessage {
+                            status,
+                            data1,
+                            data2,
+                        }
+                    };
+                    send.send(event).unwrap();
+                },
+                _ => {}, // Ignore
+            }
+        }, ()).expect("No Launchpad Mk2/Mini Input Found!");
+        let output_port = output.connect(&output_port, "").expect("No Launchpad Mk2/Mini Output Found!");
+
+        LaunchpadInternal {
+            input_port,
+            output_port,
+            recv,
+        }
+    }
+
+    pub fn send(&mut self, message: &[u8]) -> Result<(), midir::SendError> {
+        self.output_port.send(message)
+    }
+
+    pub fn poll(&self) -> Option<Vec<MidiEvent>> {
+        let events = self.recv.try_iter().collect::<Vec<MidiEvent>>();
+        if events.is_empty() { None } else { Some(events) }
+    }
+}
+
+
+
+/// A Launchpad Mk 1 / Mini / S device.
+pub struct Launchpad(LaunchpadInternal);
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GridMappingMode {
+    /// X-Y Layout.  0xXY = X th column, Y th row, from top left (00 = top left, 77 = bottom right)
+    XYLayout = 1,
+
+    /// Drum rack layout.
+    DrumRackLayout = 2,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Brightness {
+    Low     = 125,
+    Medium  = 126,
+    High    = 127,
+}
+
+// https://d2xhy469pqj8rc.cloudfront.net/sites/default/files/novation/downloads/4080/launchpad-programmers-reference.pdf
+impl Launchpad {
+    pub fn guess() -> Self { Self(LaunchpadInternal::guess("Launchpad Mini")) }
+    pub fn guess_from(input: midir::MidiInput, output: midir::MidiOutput) -> Self { Self(LaunchpadInternal::guess_from(input, output, "Launchpad Mini")) }
+    pub fn reset(&mut self) { self.0.send(&[0xB0, 0x00, 0x00]).unwrap() }
+    pub fn set_grid_mapping_mode(&mut self, mode: GridMappingMode) { self.0.send(&[0xB0, 0x00, unsafe { std::mem::transmute(mode) }]).unwrap() }
+    pub fn ctrl_double_buffer_display_update_flash_copy(&mut self, display: bool, update: bool, flash: bool, copy: bool) {
+        let display = (display   as u8) << 0;
+        let update  = (update    as u8) << 2;
+        let flash   = (flash     as u8) << 3;
+        let copy    = (copy      as u8) << 4;
+        let flags = 0b0100000 | display | update | flash | copy;
+        self.0.send(&[0xB0, 0x00, flags]).unwrap()
+    }
+
+    pub fn light_all(&mut self, brightness: Brightness) { self.0.send(&[0xB0, 0x00, unsafe { std::mem::transmute(brightness) }]).unwrap() }
+    // skipping "Set the duty cycle" for now.
+
+    pub fn light_top(&mut self, column: u8, data: u8) {
+        assert!(column < 8);
+        assert!(data < 128);
+        self.0.send(&[0xB0, 0x68 + column, data]).unwrap()
+    }
+
+    pub fn light_grid(&mut self, grid: &[u8], top: &[u8], right: &[u8]) {
+        self.0.send(&[0xB0, 0x68 + 8, 0]).unwrap(); // Reset cursor position
+
+        assert!(grid .len() == 8*8);
+        assert!(top  .len() == 8);
+        assert!(right.len() == 8);
+
+        for ab in grid .chunks_exact(2) { self.0.send(&[0x92, ab[0], ab[1]]).unwrap(); }
+        for ab in top  .chunks_exact(2) { self.0.send(&[0x92, ab[0], ab[1]]).unwrap(); }
+        for ab in right.chunks_exact(2) { self.0.send(&[0x92, ab[0], ab[1]]).unwrap(); }
+    }
+}
+
+
+
+/// A Launchpad Mark 2 Device.
+pub struct LaunchpadMk2(LaunchpadInternal);
 
 /// A single button/led
 #[derive(Debug)]
@@ -46,90 +190,38 @@ pub const SCROLL_FAST: &'static str = "\u{05}";
 pub const SCROLL_FASTER: &'static str = "\u{06}";
 pub const SCROLL_FASTEST: &'static str = "\u{07}";
 
+// https://d2xhy469pqj8rc.cloudfront.net/sites/default/files/novation/downloads/10529/launchpad-mk2-programmers-reference-guide-v1-02.pdf
 impl LaunchpadMk2 {
     /// Attempt to find the first Launchpad Mark 2 by scanning
     /// available MIDI ports with matching names
-    pub fn guess() -> LaunchpadMk2 {
-        let midi = pm::PortMidi::new().expect("Failed to open PortMidi Instance!");
-        let mut retval = Self::guess_from(&midi);
-        retval.midi = Some(midi);
-        retval
-    }
+    pub fn guess() -> Self { Self(LaunchpadInternal::guess("Launchpad MK2")) }
 
     /// Attempt to find the first Launchpad Mark 2 by scanning
     /// available MIDI ports with matching names. Bring your own
     /// PortMidi.
-    pub fn guess_from(midi: &pm::PortMidi) -> LaunchpadMk2 {
-        let devs = midi.devices().expect("Failed to get Midi Device!");
-
-        let mut input: Option<i32> = None;
-        let mut output: Option<i32> = None;
-
-        for d in devs {
-            if !d.name().contains("Launchpad MK2") {
-                continue;
-            }
-
-            if input.is_none() && d.is_input() {
-                input = Some(d.id() as i32);
-            }
-
-            if output.is_none() && d.is_output() {
-                output = Some(d.id() as i32);
-            }
-
-            if input.is_some() && output.is_some() {
-                break;
-            }
-        }
-
-        let input_port = input.expect("No Launchpad Mk2 Input Found!");
-        let output_port = output.expect("No Launchpad Mk2 Output Found!");
-
-        let input_device = midi.device(input_port)
-            .expect("No Launchpad Input found!");
-        let output_device = midi.device(output_port)
-            .expect("No Launchpad Output found!");
-
-        let input = midi.input_port(input_device, 1024)
-            .expect("Failed to open port");
-        let output = midi.output_port(output_device, 1024)
-            .expect("Failed to open port");
-
-        LaunchpadMk2 {
-            input_port: input,
-            output_port: output,
-            midi: None,
-        }
+    pub fn guess_from(input: midir::MidiInput, output: midir::MidiOutput) -> Self {
+        Self(LaunchpadInternal::guess_from(input, output, "Launchpad MK2"))
     }
 
     /// Set all LEDs to the same color
     pub fn light_all(&mut self, color: Color) {
         assert_color(color);
-        // F0h 00h 20h 29h 02h 18h 0Eh <Colour> F7h
         // Message cannot be repeated.
-        self.output_port
-            .write_sysex(0, &[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0E, color, 0xF7])
-            .expect("Fail");
+        self.0.send(&[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0E, color, 0xF7]).unwrap();
     }
 
     /// Set a single LED to flash. Uses a smaller header than `flash_led` or
     /// `flash_leds` with a single item
     pub fn flash_single(&mut self, led: &ColorLed) {
-        // ch2
-        // (0x91, <btn>, <color>)
         assert_position(led.position);
         assert_color(led.color);
-        self.output_port.write_message([0x91, led.position, led.color]).expect("Fail");
+        self.0.send(&[0x91, led.position, led.color]).unwrap();
     }
 
     /// Set a single LED to pulse. Uses a smaller header than `pulse_led` or
     /// `pulse_leds` with a single item
     pub fn pulse_single(&mut self, led: &ColorLed) {
-        // ch3
-        // (0x92, <btn>, <color>)
-
-        self.output_port.write_message([0x92, led.position, led.color]).expect("Fail");
+        self.0.send(&[0x92, led.position, led.color]).unwrap();
     }
 
     /// Set a single LED to a palette color. Use `light_single` instead, its faster.
@@ -145,19 +237,7 @@ impl LaunchpadMk2 {
         for led in leds {
             assert_position(led.position);
             assert_color(led.color);
-            self.output_port
-                .write_sysex(0,
-                             &[0xF0,
-                               0x00,
-                               0x20,
-                               0x29,
-                               0x02,
-                               0x18,
-                               0x0A,
-                               led.position,
-                               led.color,
-                               0xF7])
-                .expect("Fail");
+            self.0.send(&[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0A, led.position, led.color, 0xF7]).unwrap();
         }
     }
 
@@ -175,11 +255,7 @@ impl LaunchpadMk2 {
         for col in cols {
             assert_column(col.column);
             assert_color(col.color);
-            self.output_port
-                .write_sysex(0,
-                             &[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0C, col.column, col.color,
-                               0xF7])
-                .expect("Fail");
+            self.0.send(&[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0C, col.column, col.color, 0xF7]).unwrap();
         }
     }
 
@@ -197,10 +273,7 @@ impl LaunchpadMk2 {
         for row in rows {
             assert_row(row.row);
             assert_color(row.color);
-            self.output_port
-                .write_sysex(0,
-                             &[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0D, row.row, row.color, 0xF7])
-                .expect("Fail");
+            self.0.send(&[0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0D, row.row, row.color, 0xF7]).unwrap();
         }
     }
 
@@ -212,12 +285,11 @@ impl LaunchpadMk2 {
         // 14H <Color> <loop> <text...> F7h
         // Message cannot be repeated.
         assert_color(color);
-        let mut msg: Vec<u8> =
-            vec![0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x14, color, if doloop { 0x01 } else { 0x00 }];
+        let mut msg: Vec<u8> = vec![0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x14, color, if doloop { 0x01 } else { 0x00 }];
         msg.extend_from_slice(text.as_bytes());
         msg.push(0xF7);
 
-        self.output_port.write_sysex(0, &msg).expect("Fail");
+        self.0.send(&msg).unwrap();
     }
 
     /// Experimental. Try to set an LED by the color value in a "fast" way by
@@ -232,25 +304,22 @@ impl LaunchpadMk2 {
     }
 
     /// Retrieve pending MidiEvents
-    pub fn poll(&self) -> Option<Vec<pm::MidiEvent>> {
-        self.input_port.poll().expect("Closed Stream");
-        self.input_port.read_n(1024).expect("Failed to read")
-    }
+    pub fn poll(&self) -> Option<Vec<MidiEvent>> { self.0.poll() }
 }
 
 /// Make sure the position is valid
 fn assert_position(pos: u8) {
     // Probably just make a Result
     if !match pos {
-        11...19 => true,
-        21...29 => true,
-        31...39 => true,
-        41...49 => true,
-        51...59 => true,
-        61...69 => true,
-        71...79 => true,
-        81...89 => true,
-        104...111 => true,
+        11..=19 => true,
+        21..=29 => true,
+        31..=39 => true,
+        41..=49 => true,
+        51..=59 => true,
+        61..=69 => true,
+        71..=79 => true,
+        81..=89 => true,
+        104..=111 => true,
         _ => false,
     } {
         panic!("Bad Positon!")
